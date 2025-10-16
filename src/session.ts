@@ -1,4 +1,9 @@
-import { Uri, type WorkspaceFolder, window } from "vscode";
+import {
+	type TextDocumentChangeEvent,
+	Uri,
+	type WorkspaceFolder,
+	window,
+} from "vscode";
 import {
 	CloseAction,
 	type CloseHandlerResult,
@@ -10,6 +15,7 @@ import {
 	LanguageClient,
 	type LanguageClientOptions,
 	type Message,
+	type Middleware,
 	type ServerOptions,
 	TransportKind,
 } from "vscode-languageclient/node";
@@ -113,6 +119,8 @@ export default class Session {
 			connectionOptions: {
 				maxRestartCount: 5,
 			},
+			// Middleware to de-duplicate rapid changes to the same document
+			middleware: new BiomeMiddleware(this.biome),
 		};
 
 		return new BiomeLanguageClient(
@@ -159,14 +167,59 @@ export default class Session {
 	}
 }
 
-class Foo implements ErrorHandler {
-	error(error: Error, message: Message | undefined, count: number | undefined): ErrorHandlerResult | Promise<ErrorHandlerResult> {
-		throw new Error("Method not implemented.");
-	}
-	closed(): CloseHandlerResult | Promise<CloseHandlerResult> {
-		throw new Error("Method not implemented.");
-	}
+/**
+ * Middleware to de-duplicate rapid document changes.
+ *
+ * When files are edited rapidly (e.g., by an LLM agent), the default behavior
+ * sends every single change immediately. This middleware de-duplicates changes
+ * to the same document by only sending the final state after edits have settled.
+ *
+ * This reduces the total number of LSP notifications when a document is edited
+ * multiple times in quick succession, preventing the stdio pipe from being
+ * overwhelmed and causing EPIPE errors.
+ */
+class BiomeMiddleware implements Middleware {
+	private pendingChanges = new Map<
+		string,
+		{ event: TextDocumentChangeEvent; timeout: NodeJS.Timeout }
+	>();
 
+	constructor(private readonly biome: Biome) {}
+
+	/**
+	 * Intercepts textDocument/didChange notifications and de-duplicates them.
+	 *
+	 * When multiple rapid changes occur to the same document, this discards
+	 * intermediate states and only sends the final state after a brief delay.
+	 *
+	 * Example: 10 rapid edits to file.ts in 100ms → Only 1 notification sent
+	 */
+	didChange(
+		event: TextDocumentChangeEvent,
+		next: (event: TextDocumentChangeEvent) => Promise<void>,
+	): Promise<void> {
+		const uri = event.document.uri.toString();
+
+		// Clear any pending notification for this document
+		// This discards intermediate states when rapid edits occur
+		const pending = this.pendingChanges.get(uri);
+		if (pending) {
+			clearTimeout(pending.timeout);
+		}
+
+		// Schedule the change to be sent after a brief delay (50ms)
+		// If more changes arrive before the delay expires, this will be cancelled
+		const timeout = setTimeout(() => {
+			this.pendingChanges.delete(uri);
+			this.biome.logger.debug(`Dispatching didChange for ${event.document.uri.fsPath}`);
+			next(event);
+		}, 50);
+
+		this.pendingChanges.set(uri, { event, timeout });
+
+		// Return immediately - the actual notification will be sent after the delay
+		return Promise.resolve();
+	}
 }
 
 /**
