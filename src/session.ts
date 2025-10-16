@@ -1,9 +1,15 @@
 import { Uri, type WorkspaceFolder, window } from "vscode";
 import {
+	CloseAction,
+	type CloseHandlerResult,
 	type DocumentFilter,
+	ErrorAction,
+	type ErrorHandler,
+	type ErrorHandlerResult,
 	type InitializeParams,
 	LanguageClient,
 	type LanguageClientOptions,
+	type Message,
 	type ServerOptions,
 	TransportKind,
 } from "vscode-languageclient/node";
@@ -101,6 +107,12 @@ export default class Session {
 					rootUri: this.singleFileFolder,
 				}),
 			},
+			// Custom error handler to gracefully handle server crashes and EPIPE errors
+			errorHandler: new BiomeErrorHandler(this.biome),
+			// Connection options to control restart behavior
+			connectionOptions: {
+				maxRestartCount: 5,
+			},
 		};
 
 		return new BiomeLanguageClient(
@@ -144,6 +156,74 @@ export default class Session {
 				scheme,
 			}));
 		});
+	}
+}
+
+class Foo implements ErrorHandler {
+	error(error: Error, message: Message | undefined, count: number | undefined): ErrorHandlerResult | Promise<ErrorHandlerResult> {
+		throw new Error("Method not implemented.");
+	}
+	closed(): CloseHandlerResult | Promise<CloseHandlerResult> {
+		throw new Error("Method not implemented.");
+	}
+
+}
+
+/**
+ * Custom error handler for the Biome language server.
+ *
+ * This error handler gracefully handles server crashes and EPIPE errors
+ * that can occur when files are edited rapidly (e.g., by an LLM agent).
+ * It prevents the extension from attempting to write to a destroyed stream
+ * and provides better logging and error recovery.
+ */
+class BiomeErrorHandler implements ErrorHandler {
+	constructor(private readonly biome: Biome) {}
+
+	/**
+	 * Handles errors that occur during communication with the server.
+	 *
+	 * @param error The error that occurred
+	 * @param _message The message that was being sent when the error occurred
+	 * @param count The number of errors that have occurred
+	 * @returns The action to take in response to the error
+	 */
+	error(error: Error, _message: Message | undefined, count: number | undefined): ErrorHandlerResult | Promise<ErrorHandlerResult> {
+		// Log the error for debugging
+		this.biome.logger.error(`LSP error (count: ${count}): ${error.message}`);
+
+		// For EPIPE errors (broken pipe), the server has already crashed
+		// Don't try to continue - shutdown gracefully
+		if (
+			error.message.includes("EPIPE") ||
+			error.message.includes("stream was destroyed")
+		) {
+			this.biome.logger.error(
+				"Server connection lost (EPIPE). Shutting down client.",
+			);
+			return { action: ErrorAction.Shutdown };
+		}
+
+		// For other errors, retry up to 5 times
+		if ((count ?? 0) < 5) {
+			this.biome.logger.info(`Retrying after error (attempt ${(count ?? 0) + 1}/5)`);
+			return { action: ErrorAction.Continue };
+		}
+
+		// After 5 errors, give up and shutdown
+		this.biome.logger.error("Too many errors occurred. Shutting down client.");
+		return { action: ErrorAction.Shutdown };
+	}
+
+	/**
+	 * Handles the case where the server closes the connection.
+	 *
+	 * @returns The action to take when the server closes
+	 */
+	closed(): CloseHandlerResult | Promise<CloseHandlerResult> {
+		this.biome.logger.warn("Server connection closed");
+		// Don't restart automatically - let the extension handle it
+		return { action: CloseAction.DoNotRestart };
 	}
 }
 
